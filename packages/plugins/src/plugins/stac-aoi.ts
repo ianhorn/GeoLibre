@@ -63,26 +63,21 @@ function roundGeometry(geometry: Geometry): Geometry {
   return { ...geometry, coordinates: roundCoordinates(geometry.coordinates) } as Geometry;
 }
 
+/** How many positions lie under a coordinates value. */
+function countCoordinates(value: unknown): number {
+  if (!Array.isArray(value)) return 0;
+  if (typeof value[0] === "number") return 1;
+  return value.reduce<number>((sum, child) => sum + countCoordinates(child), 0);
+}
+
 /** How many positions a geometry carries, for refusing one too large to send. */
 export function countPositions(geometry: Geometry): number {
-  /** How many positions lie under a coordinates value. */
-  const count = (value: unknown): number => {
-    if (!Array.isArray(value)) return 0;
-    if (typeof value[0] === "number") return 1;
-    return value.reduce<number>((sum, child) => sum + count(child), 0);
-  };
-  return parts(geometry).reduce((sum, part) => sum + count(part.coordinates), 0);
+  return parts(geometry).reduce((sum, part) => sum + countCoordinates(part.coordinates), 0);
 }
 
 /** How many positions a list of coordinate arrays carries. */
 function countAll(coordinates: unknown[]): number {
-  /** How many positions lie under a coordinates value. */
-  const count = (value: unknown): number => {
-    if (!Array.isArray(value)) return 0;
-    if (typeof value[0] === "number") return 1;
-    return value.reduce<number>((sum, child) => sum + count(child), 0);
-  };
-  return coordinates.reduce<number>((sum, one) => sum + count(one), 0);
+  return coordinates.reduce<number>((sum, one) => sum + countCoordinates(one), 0);
 }
 
 /** A search geometry, and how many inputs of a lower dimension it left out. */
