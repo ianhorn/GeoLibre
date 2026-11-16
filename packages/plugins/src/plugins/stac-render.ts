@@ -30,6 +30,8 @@ const GRID = 17;
 const MAX_WINDOW = 2048;
 /** Most bands one rendering reads: a formula past this is not an index anyone typed. */
 const MAX_BANDS = 8;
+/** Most scenes a mosaic lays under its top scene. */
+export const MAX_MOSAIC_UNDER = 24;
 
 /**
  * One band of one file, with the scale and offset that turn its values into reflectance.
@@ -83,12 +85,37 @@ export interface RenderStyle {
 }
 
 /**
+ * A scene laid under the top scene of a mosaic: the same recipe read from another item. Its bands
+ * are in the order of the recipe's own, and `bbox` is its footprint so a tile it cannot touch is
+ * never read.
+ */
+export interface MosaicScene {
+  /** West, south, east, north in degrees. */
+  bbox: [number, number, number, number];
+  bands: RenderBand[];
+}
+
+/**
  * What to draw: three bands as red, green and blue, or a formula over several bands. `bands` of
  * an index follow the order of {@link formulaNames}.
+ *
+ * `under` makes it a mosaic: `bands` are the top scene, and each scene in `under` (best first)
+ * fills only the pixels everything above it left empty. A recipe without it draws one scene.
  */
 export type StacRenderSpec =
-  | { kind: "rgb"; bands: [RenderBand, RenderBand, RenderBand]; style?: RenderStyle }
-  | { kind: "index"; formula: string; bands: RenderBand[]; style?: RenderStyle };
+  | {
+      kind: "rgb";
+      bands: [RenderBand, RenderBand, RenderBand];
+      style?: RenderStyle;
+      under?: MosaicScene[];
+    }
+  | {
+      kind: "index";
+      formula: string;
+      bands: RenderBand[];
+      style?: RenderStyle;
+      under?: MosaicScene[];
+    };
 
 /**
  * The tile URL template of a rendering.
@@ -184,6 +211,48 @@ function parseStyle(value: unknown): RenderStyle | null {
   return style;
 }
 
+/** Reads a list of bands, or null when it is not a list of valid bands. */
+function parseBands(value: unknown): RenderBand[] | null {
+  if (!Array.isArray(value) || value.length > MAX_BANDS) return null;
+  const bands = value.map(parseBand);
+  return bands.some((band) => band === null) ? null : (bands as RenderBand[]);
+}
+
+/**
+ * How many bands a formula reads, or -1 when it is not a formula a rendering may use. Checked
+ * before the bands are counted against it.
+ */
+function bandCountOf(formula: unknown): number {
+  if (typeof formula !== "string" || formula.length > 500 || !isValidFormula(formula)) return -1;
+  return formulaNames(formula).length;
+}
+
+/** Reads the scenes under a mosaic's top scene, or null when any is not valid. */
+function parseUnder(value: unknown, bandCount: number): MosaicScene[] | null {
+  if (!Array.isArray(value) || value.length > MAX_MOSAIC_UNDER) return null;
+  const scenes: MosaicScene[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) return null;
+    const { bbox, bands } = entry as { bbox?: unknown; bands?: unknown };
+    if (!Array.isArray(bbox) || bbox.length !== 4) return null;
+    const [west, south, east, north] = bbox;
+    if (
+      !finiteIn(west, -180, 180) ||
+      !finiteIn(east, -180, 180) ||
+      !finiteIn(south, -90, 90) ||
+      !finiteIn(north, -90, 90) ||
+      west > east ||
+      south > north
+    ) {
+      return null;
+    }
+    const parsed = parseBands(bands);
+    if (!parsed || parsed.length !== bandCount) return null;
+    scenes.push({ bbox: [west, south, east, north], bands: parsed });
+  }
+  return scenes;
+}
+
 /** The parts of a rendering tile request. */
 export interface RenderTileRequest {
   z: number;
@@ -211,9 +280,8 @@ export function parseRenderTileUrl(url: string): RenderTileRequest | null {
   if (typeof raw !== "object" || raw === null) return null;
   const spec = raw as { kind?: unknown; formula?: unknown; bands?: unknown };
   if (!Array.isArray(spec.bands) || spec.bands.length > MAX_BANDS) return null;
-  const bands = spec.bands.map(parseBand);
-  if (bands.some((band) => band === null)) return null;
-  const valid = bands as RenderBand[];
+  const valid = parseBands(spec.bands);
+  if (!valid) return null;
   const at = { z: Number(match[1]), x: Number(match[2]), y: Number(match[3]) };
   let style: RenderStyle | undefined;
   if ((raw as { style?: unknown }).style !== undefined) {
@@ -221,26 +289,26 @@ export function parseRenderTileUrl(url: string): RenderTileRequest | null {
     if (!parsed) return null;
     style = parsed;
   }
+  const wanted = spec.kind === "rgb" ? 3 : spec.kind === "index" ? bandCountOf(spec.formula) : -1;
+  if (wanted < 0 || valid.length !== wanted) return null;
+  let under: MosaicScene[] | undefined;
+  const rawUnder = (raw as { under?: unknown }).under;
+  if (rawUnder !== undefined) {
+    const parsed = parseUnder(rawUnder, wanted);
+    if (!parsed) return null;
+    if (parsed.length) under = parsed;
+  }
+  const extras = { ...(style ? { style } : {}), ...(under ? { under } : {}) };
   if (spec.kind === "rgb") {
-    if (valid.length !== 3) return null;
     return {
       ...at,
-      spec: {
-        kind: "rgb",
-        bands: valid as [RenderBand, RenderBand, RenderBand],
-        ...(style ? { style } : {}),
-      },
+      spec: { kind: "rgb", bands: valid as [RenderBand, RenderBand, RenderBand], ...extras },
     };
   }
-  if (spec.kind === "index") {
-    const formula = spec.formula;
-    if (typeof formula !== "string" || formula.length > 500 || !isValidFormula(formula)) {
-      return null;
-    }
-    if (formulaNames(formula).length !== valid.length) return null;
-    return { ...at, spec: { kind: "index", formula, bands: valid, ...(style ? { style } : {}) } };
-  }
-  return null;
+  return {
+    ...at,
+    spec: { kind: "index", formula: spec.formula as string, bands: valid, ...extras },
+  };
 }
 
 /**
@@ -606,6 +674,7 @@ function readableBandHref(band: RenderBand, signal?: AbortSignal): Promise<strin
 /** Reads the bands' files for a tile and paints it as RGBA, or null when a band has no data. */
 async function renderWith(
   request: RenderTileRequest,
+  bands: readonly RenderBand[],
   urls: readonly string[],
   signal?: AbortSignal,
 ): Promise<Uint8ClampedArray | null> {
@@ -624,13 +693,79 @@ async function renderWith(
     return found;
   };
   const samples = await Promise.all(
-    spec.bands.map((band, i) => sampleBand(datasets[i], band, coordinatesFor(datasets[i].crs))),
+    bands.map((band, i) => sampleBand(datasets[i], band, coordinatesFor(datasets[i].crs))),
   );
   if (samples.some((band) => band === null)) return null;
   const rgba = new Uint8ClampedArray(TILE_SIZE * TILE_SIZE * 4);
-  const stretches = spec.bands.map((band, i) => stretchFor(band, datasets[i].bitsPerSample));
+  const stretches = bands.map((band, i) => stretchFor(band, datasets[i].bitsPerSample));
   paintRender(spec, samples as Float32Array[], stretches, rgba);
   return rgba;
+}
+
+/**
+ * The west, south, east and north of a tile in degrees.
+ *
+ * @param z - Zoom level.
+ * @param x - Tile column.
+ * @param y - Tile row.
+ */
+export function tileLonLatBounds(
+  z: number,
+  x: number,
+  y: number,
+): [number, number, number, number] {
+  const n = 2 ** z;
+  const lat = (row: number) =>
+    (Math.atan(Math.sinh(Math.PI * (1 - (2 * row) / n))) * 180) / Math.PI;
+  return [(x / n) * 360 - 180, lat(y + 1), ((x + 1) / n) * 360 - 180, lat(y)];
+}
+
+/** Whether two west, south, east, north boxes share any area or edge. */
+export function boxesTouch(
+  a: readonly [number, number, number, number],
+  b: readonly [number, number, number, number],
+): boolean {
+  return a[0] <= b[2] && b[0] <= a[2] && a[1] <= b[3] && b[1] <= a[3];
+}
+
+/** Whether no pixel of a tile is transparent. */
+function isFull(rgba: Uint8ClampedArray): boolean {
+  for (let o = 3; o < rgba.length; o += 4) if (rgba[o] === 0) return false;
+  return true;
+}
+
+/**
+ * Fills the empty pixels of `base` from `over`, leaving every pixel `base` already has.
+ *
+ * @param base - RGBA pixels, changed in place.
+ * @param over - RGBA pixels of the same size.
+ */
+export function fillGaps(base: Uint8ClampedArray, over: Uint8ClampedArray): void {
+  for (let o = 3; o < base.length; o += 4) {
+    if (base[o] !== 0 || over[o] === 0) continue;
+    base[o - 3] = over[o - 3];
+    base[o - 2] = over[o - 2];
+    base[o - 1] = over[o - 1];
+    base[o] = over[o];
+  }
+}
+
+/** Renders one scene's bands for a tile, reopening them once when a read fails. */
+async function renderScene(
+  request: RenderTileRequest,
+  bands: readonly RenderBand[],
+  signal?: AbortSignal,
+): Promise<Uint8ClampedArray | null> {
+  const urls = await Promise.all(bands.map((band) => readableBandHref(band, signal)));
+  try {
+    return await renderWith(request, bands, urls, signal);
+  } catch (error) {
+    if (signal?.aborted) throw error;
+    // A failed read or decode may have left a bad block in the reader's cache; reopen the bands
+    // and try once more.
+    for (const url of urls) bandCache.delete(url);
+    return renderWith(request, bands, urls, signal);
+  }
 }
 
 /**
@@ -644,16 +779,21 @@ export async function renderStacTile(
   request: RenderTileRequest,
   signal?: AbortSignal,
 ): Promise<Uint8ClampedArray | null> {
-  const urls = await Promise.all(request.spec.bands.map((band) => readableBandHref(band, signal)));
-  try {
-    return await renderWith(request, urls, signal);
-  } catch (error) {
-    if (signal?.aborted) throw error;
-    // A failed read or decode may have left a bad block in the reader's cache; reopen the bands
-    // and try once more.
-    for (const url of urls) bandCache.delete(url);
-    return renderWith(request, urls, signal);
+  let tile = await renderScene(request, request.spec.bands, signal);
+  const under = request.spec.under;
+  if (!under?.length) return tile;
+  // A mosaic: each scene below fills only what the ones above left empty, and a tile that is
+  // already full never reads the rest.
+  const bounds = tileLonLatBounds(request.z, request.x, request.y);
+  for (const scene of under) {
+    if (tile && isFull(tile)) break;
+    if (!boxesTouch(bounds, scene.bbox)) continue;
+    const next = await renderScene(request, scene.bands, signal);
+    if (!next) continue;
+    if (tile) fillGaps(tile, next);
+    else tile = next;
   }
+  return tile;
 }
 
 /** Encodes a tile's pixels as a PNG. */

@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  boxesTouch,
+  fillGaps,
   paintRender,
   parseRenderTileUrl,
   pickOverview,
   renderTileUrl,
   specFromTileUrl,
   stretchFor,
+  tileLonLatBounds,
   withRenderStyle,
   type RenderBand,
   type RenderStyle,
@@ -242,4 +245,57 @@ test("missing data in any band is transparent even when the formula would give a
     out,
   );
   assert.equal(out[3], 0);
+});
+
+const scene = (name: string, count = 3) => ({
+  bbox: [4, 51, 5, 52] as [number, number, number, number],
+  bands: Array.from({ length: count }, (_, i) => band(`${name}${i}`)),
+});
+
+test("a mosaic recipe round-trips, and one scene alone carries no list", () => {
+  const mosaic: StacRenderSpec = { ...rgb, under: [scene("u1"), scene("u2")] };
+  assert.deepEqual(parseRenderTileUrl(tile(mosaic))?.spec, mosaic);
+  assert.deepEqual(parseRenderTileUrl(tile({ ...rgb, under: [] }))?.spec, rgb);
+  const index: StacRenderSpec = { ...ndvi, under: [scene("n", 2)] };
+  assert.deepEqual(parseRenderTileUrl(tile(index))?.spec, index);
+  // A style edit keeps the scenes.
+  assert.deepEqual(withRenderStyle(mosaic, { gain: 2 }).under, mosaic.under);
+});
+
+test("the parser refuses a mosaic whose scenes are not valid", () => {
+  const bad = (under: unknown) =>
+    parseRenderTileUrl(tile({ ...rgb, under } as unknown as StacRenderSpec));
+  assert.equal(bad([scene("u", 2)]), null, "a scene must have as many bands as the recipe");
+  assert.equal(bad([{ ...scene("u"), bbox: [5, 51, 4, 52] }]), null, "west past east");
+  assert.equal(bad([{ ...scene("u"), bbox: [4, 51, 5] }]), null, "a box has four numbers");
+  assert.equal(bad([{ ...scene("u"), bbox: [4, 51, 5, 95] }]), null, "latitude out of range");
+  assert.equal(
+    bad([{ bbox: [4, 51, 5, 52], bands: [band("a"), band("b"), band("c", { href: "http://x" })] }]),
+    null,
+    "every band of every scene must be https",
+  );
+  assert.equal(bad("nope"), null);
+  assert.equal(
+    bad(Array.from({ length: 25 }, (_, i) => scene(`m${i}`))),
+    null,
+    "no more than 24 scenes under the top one",
+  );
+  assert.ok(bad(Array.from({ length: 24 }, (_, i) => scene(`m${i}`))));
+});
+
+test("fillGaps keeps what the base has and takes only the empty pixels", () => {
+  const base = new Uint8ClampedArray([1, 2, 3, 255, 0, 0, 0, 0, 0, 0, 0, 0]);
+  const over = new Uint8ClampedArray([9, 9, 9, 255, 7, 8, 9, 255, 5, 5, 5, 0]);
+  fillGaps(base, over);
+  assert.deepEqual([...base], [1, 2, 3, 255, 7, 8, 9, 255, 0, 0, 0, 0]);
+});
+
+test("a tile's degree bounds and the box test", () => {
+  const [west, south, east, north] = tileLonLatBounds(1, 1, 0);
+  assert.equal(west, 0);
+  assert.equal(east, 180);
+  assert.equal(south, 0);
+  assert.ok(Math.abs(north - 85.0511287798) < 1e-6);
+  assert.equal(boxesTouch([0, 0, 1, 1], [1, 1, 2, 2]), true, "shared corner touches");
+  assert.equal(boxesTouch([0, 0, 1, 1], [1.1, 0, 2, 1]), false);
 });

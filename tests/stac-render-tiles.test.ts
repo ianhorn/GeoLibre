@@ -423,3 +423,126 @@ test("a file with no overview coarse enough is drawn thinned, not left blank", a
   assert.ok(opaque > 256 * 256 * 0.2, "the covered part is painted");
   assert.ok(reds.size > 20, "with the image's values, not a flat fill");
 });
+
+/** A 32 x 32 file of one value, 0.025 degrees a pixel (0.8 across), with its top-left corner at a longitude. */
+const flatFile = (value: number, west: number): TiffOptions => ({
+  width: 32,
+  height: 32,
+  pixelX: 0.025,
+  pixelY: 0.025,
+  origin: [west, 52],
+  value: () => value,
+});
+
+/** A mosaic of two overlapping files: A over 4..4.8 E, B over 4.4..5.2 E, both 51.2..52 N. */
+async function mosaicOf(
+  top: "a" | "b",
+): Promise<{ spec: StacRenderSpec; z: number; x: number; y: number }> {
+  const [a, b] = await Promise.all([host(flatFile(50, 4)), host(flatFile(200, 4.4))]);
+  const scene = (href: string, west: number) => ({
+    bbox: [west, 51.2, west + 0.8, 52] as [number, number, number, number],
+    bands: [bandOf(href), bandOf(href), bandOf(href)],
+  });
+  const first = top === "a" ? scene(a, 4) : scene(b, 4.4);
+  const second = top === "a" ? scene(b, 4.4) : scene(a, 4);
+  const z = 9;
+  const { x, y } = tileAt(4.6, 51.6, z);
+  return {
+    spec: {
+      kind: "rgb",
+      bands: first.bands as [RenderBand, RenderBand, RenderBand],
+      under: [second],
+    },
+    z,
+    x,
+    y,
+  };
+}
+
+/** What a mosaic tile shows at the pixels whose centres are well inside each region. */
+function regions(rgba: Uint8ClampedArray, z: number, x: number, y: number) {
+  const seen = { onlyA: new Set<number>(), overlap: new Set<number>(), onlyB: new Set<number>() };
+  let outside = 0;
+  for (let py = 0; py < 256; py += 4) {
+    for (let px = 0; px < 256; px += 4) {
+      const { lon, lat } = lonLatOfPixel(z, x, y, px, py);
+      if (lat < 51.25 || lat > 51.95) continue;
+      const alpha = rgba[(py * 256 + px) * 4 + 3];
+      const red = rgba[(py * 256 + px) * 4];
+      if (lon > 4.02 && lon < 4.38) seen.onlyA.add(alpha ? red : -1);
+      else if (lon > 4.42 && lon < 4.78) seen.overlap.add(alpha ? red : -1);
+      else if (lon > 4.82 && lon < 5.18) seen.onlyB.add(alpha ? red : -1);
+      else if (lon < 3.98 || lon > 5.22) outside += alpha;
+    }
+  }
+  return { ...seen, outside };
+}
+
+test("a mosaic fills what the top scene leaves empty from the scene below", async () => {
+  const { spec, z, x, y } = await mosaicOf("a");
+  const rgba = await renderStacTile({ z, x, y, spec });
+  assert.ok(rgba);
+  const seen = regions(rgba, z, x, y);
+  assert.deepEqual([...seen.onlyA], [50]);
+  assert.deepEqual([...seen.onlyB], [200], "the scene below shows where the top one has no data");
+  assert.deepEqual([...seen.overlap], [50], "the top scene wins where both have data");
+  assert.equal(seen.outside, 0, "nothing is drawn beyond both footprints");
+});
+
+test("the scene order decides which one wins in the overlap", async () => {
+  const { spec, z, x, y } = await mosaicOf("b");
+  const rgba = await renderStacTile({ z, x, y, spec });
+  assert.ok(rgba);
+  const seen = regions(rgba, z, x, y);
+  assert.deepEqual([...seen.overlap], [200]);
+  assert.deepEqual([...seen.onlyA], [50]);
+});
+
+/** An address nothing listens at: reading it fails, so a render that passes never touched it. */
+const DEAD = "https://127.0.0.1:1/never.tif";
+const deadBands = (): RenderBand[] => [bandOf(DEAD), bandOf(DEAD), bandOf(DEAD)];
+
+test("a scene whose footprint misses the tile is never read", async () => {
+  const href = await host(flatFile(50, 4));
+  const z = 9;
+  // The tile straddles the east edge of the file, so it is not full and the scenes below are asked.
+  const { x, y } = tileAt(4.8, 51.6, z);
+  const spec = rgbOf(href);
+  const withDead = { ...spec, under: [{ bbox: [-4, 40, -3, 41], bands: deadBands() }] };
+  const [plain, mosaic] = await Promise.all([
+    renderStacTile({ z, x, y, spec }),
+    renderStacTile({ z, x, y, spec: withDead as StacRenderSpec }),
+  ]);
+  assert.ok(plain && mosaic);
+  assert.ok(
+    plain.some((_, i) => i % 4 === 3 && plain[i] === 0),
+    "the tile has gaps, so the culling is what spared the dead scene",
+  );
+  assert.deepEqual([...mosaic], [...plain]);
+});
+
+test("a tile the top scene fills completely does not read the scenes below", async () => {
+  const href = await host(BELGIUM);
+  const z = 9;
+  const { x, y } = tileAt(4.8, 51.2, z);
+  const withDead = { ...rgbOf(href), under: [{ bbox: [-180, -90, 180, 90], bands: deadBands() }] };
+  const rgba = await renderStacTile({ z, x, y, spec: withDead as StacRenderSpec });
+  assert.ok(rgba);
+  for (let i = 3; i < rgba.length; i += 4) assert.equal(rgba[i], 255);
+});
+
+test("a tile the top scene misses is drawn from a scene below", async () => {
+  const [far, near] = await Promise.all([host(flatFile(90, 20)), host(flatFile(50, 4))]);
+  const z = 9;
+  const { x, y } = tileAt(4.4, 51.6, z);
+  const spec: StacRenderSpec = {
+    kind: "rgb",
+    bands: [bandOf(far), bandOf(far), bandOf(far)],
+    under: [{ bbox: [4, 51.2, 4.8, 52], bands: [bandOf(near), bandOf(near), bandOf(near)] }],
+  };
+  const rgba = await renderStacTile({ z, x, y, spec });
+  assert.ok(rgba, "the scene below draws the tile");
+  const seen = new Set<number>();
+  for (let i = 0; i < rgba.length; i += 4) if (rgba[i + 3] === 255) seen.add(rgba[i]);
+  assert.deepEqual([...seen], [50]);
+});

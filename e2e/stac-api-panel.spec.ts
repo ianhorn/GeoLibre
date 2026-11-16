@@ -372,6 +372,72 @@ test("Add rendering offers the combinations and indices an item has the bands fo
   await expect(layers.getByText(/NDVI \(vegetation\)/)).toBeVisible();
 });
 
+test("Mosaic results draws every result that has the bands as one layer", async ({ page }) => {
+  const band = (name: string, scene: string) => ({
+    href: `https://data.test/${scene}/${name}.tif`,
+    type: "image/tiff",
+    title: name,
+    "eo:bands": [{ common_name: name }],
+  });
+  // Two results with the same bands, and a search that returns both of them.
+  await page.route("https://api.stac.test/**", async (route) => {
+    const url = route.request().url();
+    const json = (body: unknown) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (url.endsWith("/collections")) return json({ collections: COLLECTIONS });
+    if (url.includes("/search")) {
+      const names = ["red", "green", "blue", "nir"];
+      const assets = (scene: string) =>
+        Object.fromEntries(names.map((name) => [name, band(name, scene)]));
+      return json({
+        type: "FeatureCollection",
+        features: [
+          item("scene-new", "sentinel-2", assets("new")),
+          item("scene-old", "sentinel-2", assets("old")),
+        ],
+        numberMatched: 2,
+        links: [],
+      });
+    }
+    return json({
+      type: "Catalog",
+      id: "api",
+      title: "E2E STAC API",
+      conformsTo: [
+        "https://api.stacspec.org/v1.0.0/core",
+        "https://api.stacspec.org/v1.0.0/item-search",
+      ],
+      links: [
+        { rel: "data", href: `${API}/collections` },
+        { rel: "search", href: `${API}/search`, method: "POST" },
+      ],
+    });
+  });
+  await page.route("https://data.test/**", (route) =>
+    route.fulfill({ status: 404, body: "fixture only" }),
+  );
+  await waitForMap(page);
+  await connect(page, API);
+  const mosaic = page.getByRole("combobox").filter({ hasText: /^Mosaic results/ });
+  await expect(mosaic).toBeHidden();
+
+  await page.getByLabel("Limit search to the current map extent").uncheck();
+  await page.getByRole("button", { name: "Search items" }).click();
+  await expect(mosaic).toBeVisible();
+
+  await mosaic.selectOption({ label: "NDVI (vegetation)" });
+  await expect(page.getByText(/Added a mosaic of 2 scene\(s\)/)).toBeVisible();
+  const layers = page.getByRole("complementary", { name: "Layers" });
+  await expect(layers.getByText(/Mosaic results: NDVI \(vegetation\) \(2\)/)).toBeVisible();
+
+  // One layer: the first result on top, the second laid under it.
+  const recipes = await liveRenderingRecipes(page);
+  expect(recipes).toHaveLength(1);
+  const [recipe] = recipes as Array<{ bands: Array<{ href: string }>; under: unknown[] }>;
+  expect(recipe.bands.every((b) => b.href.includes("/new/"))).toBe(true);
+  expect(recipe.under).toHaveLength(1);
+});
+
 test("the buffer and cloud cover limits are checkboxes that unlock a number", async ({ page }) => {
   const searches: string[] = [];
   await serveApi(page, searches);

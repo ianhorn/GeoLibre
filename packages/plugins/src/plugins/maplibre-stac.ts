@@ -77,6 +77,7 @@ import {
 } from "./stac-bands";
 import { buildCatalogTree } from "./stac-catalog-tree";
 import {
+  MAX_MOSAIC_UNDER,
   registerStacRenderProtocol,
   renderTileUrl,
   type RenderBand,
@@ -257,6 +258,11 @@ export interface StacLabels {
   groupIndices: string;
   renderNeedsMapLibre: string;
   renderMissingBand: (name: string) => string;
+  mosaic: string;
+  mosaicHint: string;
+  mosaicNoScenes: (name: string) => string;
+  mosaicAdded: (count: number, name: string) => string;
+  mosaicTruncated: (count: number) => string;
   sortLabel: string;
   sortDefault: string;
   sortNewest: string;
@@ -392,6 +398,11 @@ let labels: StacLabels = {
   groupIndices: "Indices",
   renderNeedsMapLibre: "Renderings need the MapLibre renderer.",
   renderMissingBand: (name) => `This item has no band called ${name}.`,
+  mosaic: "Mosaic results",
+  mosaicHint: "Draw every result that has the bands as one layer, newest scene on top",
+  mosaicNoScenes: (name) => `None of the results has the bands for ${name}.`,
+  mosaicAdded: (count, name) => `Added a mosaic of ${count} scene(s): ${name}.`,
+  mosaicTruncated: (count) => `Only the first ${count} scenes were used.`,
   sortLabel: "Sort by date",
   sortDefault: "Server default",
   sortNewest: "Newest first",
@@ -1254,6 +1265,34 @@ function addRendering(
   const app = appRef;
   // engine-audit-allow: getMap-mapbox -- detects MapLibre; renderings are hidden on Mapbox
   if (!app?.addTileLayer || !app.getMap?.()) throw new Error(labels.renderNeedsMapLibre);
+  const spec = renderSpecOf(connection, item, choice);
+  registerStacRenderProtocol();
+  const bbox = itemBbox(item);
+  const layerId = app.addTileLayer(`${itemTitle(item)} — ${choice.name}`, renderTileUrl(spec), {
+    tileSize: 256,
+    // Tiles deeper than the data's own detail just upsample, and each reads only a small window.
+    maxzoom: 17,
+    ...(bbox ? { bounds: bbox } : {}),
+    metadata: { stacItemId: item.id, stacRendering: choice.name },
+  });
+  if (bbox) app.fitBounds?.(bbox);
+  return layerId;
+}
+
+/**
+ * The recipe for a band combination or index of one item.
+ *
+ * @param connection - The catalog the item came from, for how its private assets are signed.
+ * @param item - The item whose bands are drawn.
+ * @param choice - The combination or index.
+ * @returns The recipe.
+ * @throws When the item lacks a band the choice needs.
+ */
+function renderSpecOf(
+  connection: StacConnection,
+  item: StacItem,
+  choice: StacRenderingChoice,
+): StacRenderSpec {
   const bands = itemBands(item);
   /** The item's band by name, or an error naming what it lacks. */
   const need = (name: string): StacBand => {
@@ -1274,17 +1313,81 @@ function addRendering(
     );
     spec = { kind: "index", formula, bands: read };
   }
+  return spec;
+}
+
+/** What {@link addMosaic} made. */
+export interface StacMosaicResult {
+  layerId: string;
+  /** Scenes drawn, the top one included. */
+  scenes: number;
+  /** Whether scenes past the renderer's limit were left out. */
+  truncated: boolean;
+}
+
+/**
+ * Adds a band combination or index of several items as one tile layer. The first item that has the
+ * bands is the top scene; each later one fills only what the scenes above leave empty, so the order
+ * given is the order of priority (a newest-first search puts the newest scene on top).
+ *
+ * @param connection - The catalog the items came from, for how their private assets are signed.
+ * @param items - The scenes, best first. Items without the bands or a footprint are skipped.
+ * @param choice - The combination or index.
+ * @returns The new layer and how many scenes it draws.
+ * @throws When the renderer is not MapLibre, or no item has the bands.
+ */
+function addMosaic(
+  connection: StacConnection,
+  items: readonly StacItem[],
+  choice: StacRenderingChoice,
+): StacMosaicResult {
+  const app = appRef;
+  // engine-audit-allow: getMap-mapbox -- detects MapLibre; renderings are hidden on Mapbox
+  if (!app?.addTileLayer || !app.getMap?.()) throw new Error(labels.renderNeedsMapLibre);
+  const scenes: { item: StacItem; spec: StacRenderSpec; bbox: [number, number, number, number] }[] =
+    [];
+  for (const item of items) {
+    const bbox = itemBbox(item);
+    if (!bbox) continue;
+    try {
+      scenes.push({ item, spec: renderSpecOf(connection, item, choice), bbox });
+    } catch {
+      // An item without these bands just is not part of the mosaic.
+    }
+  }
+  if (!scenes.length) throw new Error(labels.mosaicNoScenes(choice.name));
+  const limit = MAX_MOSAIC_UNDER + 1;
+  const used = scenes.slice(0, limit);
+  const [top, ...rest] = used;
+  const spec: StacRenderSpec = {
+    ...top.spec,
+    ...(rest.length
+      ? { under: rest.map((scene) => ({ bbox: scene.bbox, bands: scene.spec.bands })) }
+      : {}),
+  } as StacRenderSpec;
+  const union: [number, number, number, number] = [
+    Math.min(...used.map((scene) => scene.bbox[0])),
+    Math.min(...used.map((scene) => scene.bbox[1])),
+    Math.max(...used.map((scene) => scene.bbox[2])),
+    Math.max(...used.map((scene) => scene.bbox[3])),
+  ];
   registerStacRenderProtocol();
-  const bbox = itemBbox(item);
-  const layerId = app.addTileLayer(`${itemTitle(item)} — ${choice.name}`, renderTileUrl(spec), {
-    tileSize: 256,
-    // Tiles deeper than the data's own detail just upsample, and each reads only a small window.
-    maxzoom: 17,
-    ...(bbox ? { bounds: bbox } : {}),
-    metadata: { stacItemId: item.id, stacRendering: choice.name },
-  });
-  if (bbox) app.fitBounds?.(bbox);
-  return layerId;
+  const layerId = app.addTileLayer(
+    `${labels.mosaic}: ${choice.name} (${used.length})`,
+    renderTileUrl(spec),
+    {
+      tileSize: 256,
+      maxzoom: 17,
+      bounds: union,
+      metadata: {
+        stacItemIds: used.map((scene) => scene.item.id),
+        stacRendering: choice.name,
+        stacMosaic: true,
+      },
+    },
+  );
+  app.fitBounds?.(union);
+  return { layerId, scenes: used.length, truncated: scenes.length > limit };
 }
 
 /** An item's descriptive title when available, otherwise its stable identifier. */
@@ -1464,6 +1567,12 @@ function buildPanel(container: HTMLElement): () => void {
   clearResultsButton.style.cssText = `${style.button}flex:1 1 0;`;
   setDisabled(clearResultsButton, true);
   searchActions.append(searchButton, clearResultsButton);
+  // Mosaic: one menu over the whole result list, shown once there are results to combine.
+  const mosaicSelect = el("select");
+  mosaicSelect.style.cssText = style.input;
+  mosaicSelect.title = labels.mosaicHint;
+  mosaicSelect.setAttribute("aria-label", labels.mosaicHint);
+  mosaicSelect.hidden = true;
   searchSection.append(
     catalogInfo,
     collectionSelect,
@@ -1475,6 +1584,7 @@ function buildPanel(container: HTMLElement): () => void {
     sortCloudRow,
     additionalWrap,
     searchActions,
+    mosaicSelect,
   );
 
   // Raster rendering options, applied to every GeoTIFF/COG asset added from the
@@ -1708,6 +1818,7 @@ function buildPanel(container: HTMLElement): () => void {
     fetchedItems = [];
     nextPage = undefined;
     searchCursor = undefined;
+    updateMosaicMenu();
     results.innerHTML = "";
     cardsByItemId.clear();
     selectItem(null, false);
@@ -1745,7 +1856,42 @@ function buildPanel(container: HTMLElement): () => void {
     }
   };
 
+  /**
+   * Fills the Mosaic menu with every combination and index at least one result has the bands for,
+   * and hides it when fewer than two results could be combined.
+   */
+  const updateMosaicMenu = (): void => {
+    mosaicSelect.innerHTML = "";
+    const combinations = new Set<string>();
+    const indices = new Set<string>();
+    for (const item of allItems) {
+      const bands = itemBands(item);
+      for (const name of availableCombinations(bands)) combinations.add(name);
+      for (const name of availableIndices(bands)) indices.add(name);
+    }
+    mosaicSelect.hidden = allItems.length < 2 || (!combinations.size && !indices.size);
+    if (mosaicSelect.hidden) return;
+    const placeholder = el("option", labels.mosaic);
+    placeholder.value = "";
+    mosaicSelect.append(placeholder);
+    for (const [title, kind, names] of [
+      [labels.groupCombinations, "combination", combinations],
+      [labels.groupIndices, "index", indices],
+    ] as const) {
+      if (!names.size) continue;
+      const optgroup = el("optgroup");
+      optgroup.label = title;
+      for (const name of names) {
+        const option = el("option", name);
+        option.value = `${kind}:${name}`;
+        optgroup.append(option);
+      }
+      mosaicSelect.append(optgroup);
+    }
+  };
+
   const renderItems = (): void => {
+    updateMosaicMenu();
     results.innerHTML = "";
     cardsByItemId.clear();
     for (const item of allItems) {
@@ -2144,6 +2290,22 @@ function buildPanel(container: HTMLElement): () => void {
   const presetConnection = initialCatalogUrl ? connectCatalog() : undefined;
   searchButton.addEventListener("click", () => void runSearch(false));
   clearResultsButton.addEventListener("click", () => clearSearchResults());
+  mosaicSelect.addEventListener("change", () => {
+    const [kind, ...rest] = mosaicSelect.value.split(":");
+    const name = rest.join(":");
+    mosaicSelect.value = "";
+    if (!name || (kind !== "combination" && kind !== "index")) return;
+    setStatus(labels.adding(name));
+    try {
+      if (!connection) throw new Error(labels.addFailed);
+      // The list is already in the order the user sorted it, so the first scene is on top.
+      const made = addMosaic(connection, allItems, { kind, name });
+      const note = made.truncated ? ` ${labels.mosaicTruncated(made.scenes)}` : "";
+      setStatus(`${labels.mosaicAdded(made.scenes, name)}${note}`);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : labels.addFailed, true);
+    }
+  });
   loadMore.addEventListener("click", () => void runSearch(true));
   let activeShape: StacDrawShape | null = null;
   /** Stops a drawing in progress, whichever tool it is, and puts its button back. */
