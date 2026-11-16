@@ -438,6 +438,64 @@ test("Mosaic results draws every result that has the bands as one layer", async 
   expect(recipe.under).toHaveLength(1);
 });
 
+test("Load point clouds is offered for results with a cloud, and reports the ones that fail", async ({
+  page,
+}) => {
+  const cloud = (id: string) => ({
+    copc: {
+      href: `https://data.test/${id}.copc.laz`,
+      type: "application/vnd.laszip+copc",
+      title: id,
+    },
+  });
+  await page.route("https://api.stac.test/**", async (route) => {
+    const url = route.request().url();
+    const json = (body: unknown) =>
+      route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+    if (url.endsWith("/collections")) return json({ collections: COLLECTIONS });
+    if (url.includes("/search")) {
+      return json({
+        type: "FeatureCollection",
+        features: [
+          item("cloud-a", "sentinel-2", cloud("a")),
+          item("cloud-b", "sentinel-2", cloud("b")),
+        ],
+        numberMatched: 2,
+        links: [],
+      });
+    }
+    return json({
+      type: "Catalog",
+      id: "api",
+      title: "E2E STAC API",
+      conformsTo: [
+        "https://api.stacspec.org/v1.0.0/core",
+        "https://api.stacspec.org/v1.0.0/item-search",
+      ],
+      links: [
+        { rel: "data", href: `${API}/collections` },
+        { rel: "search", href: `${API}/search`, method: "POST" },
+      ],
+    });
+  });
+  await page.route("https://data.test/**", (route) =>
+    route.fulfill({ status: 404, body: "fixture only" }),
+  );
+  await waitForMap(page);
+  await connect(page, API);
+  const load = page.getByRole("button", { name: "Load point clouds" });
+  await expect(load).toBeHidden();
+
+  await page.getByLabel("Limit search to the current map extent").uncheck();
+  await page.getByRole("button", { name: "Search items" }).click();
+  await expect(load).toBeVisible();
+
+  // The files are not there, so nothing loads and the panel names what failed.
+  await load.click();
+  await expect(page.getByText(/Could not load: cloud-a, cloud-b/)).toBeVisible();
+  await expect(load).toBeEnabled();
+});
+
 test("the buffer and cloud cover limits are checkboxes that unlock a number", async ({ page }) => {
   const searches: string[] = [];
   await serveApi(page, searches);

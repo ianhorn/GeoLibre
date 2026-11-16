@@ -83,6 +83,7 @@ import {
   type RenderBand,
   type StacRenderSpec,
 } from "./stac-render";
+import { pointCloudsOf } from "./stac-pointclouds";
 import { el, setDisabled } from "../panel-dom";
 import { addVectorLayersFromUrl } from "./maplibre-vector";
 import { addLidarLayerFromUrl, addZarrRasterLayer } from "./maplibre-components";
@@ -263,6 +264,13 @@ export interface StacLabels {
   mosaicNoScenes: (name: string) => string;
   mosaicAdded: (count: number, name: string) => string;
   mosaicTruncated: (count: number) => string;
+  pointClouds: string;
+  pointCloudsHint: string;
+  pointCloudsNone: string;
+  pointCloudsLoaded: (count: number) => string;
+  pointCloudsFailed: (names: string) => string;
+  pointCloudsSkipped: (count: number) => string;
+  pointCloudsGroup: (count: number) => string;
   sortLabel: string;
   sortDefault: string;
   sortNewest: string;
@@ -403,6 +411,13 @@ let labels: StacLabels = {
   mosaicNoScenes: (name) => `None of the results has the bands for ${name}.`,
   mosaicAdded: (count, name) => `Added a mosaic of ${count} scene(s): ${name}.`,
   mosaicTruncated: (count) => `Only the first ${count} scenes were used.`,
+  pointClouds: "Load point clouds",
+  pointCloudsHint: "Stream the point cloud of every result that has one, as one group of layers",
+  pointCloudsNone: "None of the results has a point cloud that can be loaded.",
+  pointCloudsLoaded: (count) => `Loaded ${count} point cloud(s).`,
+  pointCloudsFailed: (names) => `Could not load: ${names}.`,
+  pointCloudsSkipped: (count) => `${count} more were left out to keep the set small.`,
+  pointCloudsGroup: (count) => `STAC point clouds (${count})`,
   sortLabel: "Sort by date",
   sortDefault: "Server default",
   sortNewest: "Newest first",
@@ -1316,6 +1331,75 @@ function renderSpecOf(
   return spec;
 }
 
+/** What {@link addPointCloudSet} did. */
+export interface StacPointCloudSetResult {
+  /** The layers that loaded, in order. */
+  layerIds: string[];
+  /** The group they were put in, when more than one loaded. */
+  groupId?: string;
+  /** Titles of the results whose cloud could not be loaded. */
+  failed: string[];
+  /** Results with a cloud that were left out by the limit. */
+  skipped: number;
+}
+
+/**
+ * Streams the point cloud of each result into the LiDAR control, one layer per cloud, and groups
+ * the layers so the set can be shown, faded or removed as one. The control draws one cloud per
+ * load, so this is a set of layers and not a single merged one. A cloud that fails does not stop
+ * the rest.
+ *
+ * @param connection - The catalog the items came from, for how their private assets are signed.
+ * @param items - The results, best first.
+ * @param signal - Cancels signing requests.
+ * @returns What loaded and what did not.
+ * @throws When no result has a point cloud, or the app cannot load one.
+ */
+async function addPointCloudSet(
+  connection: StacConnection,
+  items: readonly StacItem[],
+  signal?: AbortSignal,
+): Promise<StacPointCloudSetResult> {
+  const app = appRef;
+  if (!app) throw new Error(labels.addFailed);
+  const { clouds, skipped } = pointCloudsOf(items);
+  if (!clouds.length) throw new Error(labels.pointCloudsNone);
+  const layerIds: string[] = [];
+  const failed: string[] = [];
+  const loaded: StacItem[] = [];
+  for (const cloud of clouds) {
+    try {
+      // Signed for a private container but not remembered, as for a single cloud.
+      const href = await readableHref(connection, cloud.item, cloud.asset.href, signal);
+      // The camera moves once, to the whole set, after the last cloud.
+      const id = await addLidarLayerFromUrl(app, href, { fit: false });
+      if (!id) throw new Error(labels.addFailed);
+      layerIds.push(id);
+      loaded.push(cloud.item);
+    } catch {
+      failed.push(itemTitle(cloud.item));
+    }
+  }
+  let groupId: string | undefined;
+  if (layerIds.length > 1) {
+    groupId = useAppStore
+      .getState()
+      .addLayerGroup(labels.pointCloudsGroup(layerIds.length), layerIds);
+  }
+  const boxes = loaded
+    .map(itemBbox)
+    .filter((box): box is [number, number, number, number] => !!box);
+  if (boxes.length) {
+    app.fitBounds?.([
+      Math.min(...boxes.map((box) => box[0])),
+      Math.min(...boxes.map((box) => box[1])),
+      Math.max(...boxes.map((box) => box[2])),
+      Math.max(...boxes.map((box) => box[3])),
+    ]);
+  }
+  return { layerIds, ...(groupId ? { groupId } : {}), failed, skipped };
+}
+
 /** What {@link addMosaic} made. */
 export interface StacMosaicResult {
   layerId: string;
@@ -1573,6 +1657,11 @@ function buildPanel(container: HTMLElement): () => void {
   mosaicSelect.title = labels.mosaicHint;
   mosaicSelect.setAttribute("aria-label", labels.mosaicHint);
   mosaicSelect.hidden = true;
+  const pointCloudButton = el("button", labels.pointClouds);
+  pointCloudButton.type = "button";
+  pointCloudButton.style.cssText = style.button;
+  pointCloudButton.title = labels.pointCloudsHint;
+  pointCloudButton.hidden = true;
   searchSection.append(
     catalogInfo,
     collectionSelect,
@@ -1585,6 +1674,7 @@ function buildPanel(container: HTMLElement): () => void {
     additionalWrap,
     searchActions,
     mosaicSelect,
+    pointCloudButton,
   );
 
   // Raster rendering options, applied to every GeoTIFF/COG asset added from the
@@ -1861,6 +1951,7 @@ function buildPanel(container: HTMLElement): () => void {
    * and hides it when fewer than two results could be combined.
    */
   const updateMosaicMenu = (): void => {
+    pointCloudButton.hidden = pointCloudsOf(allItems).clouds.length < 2;
     mosaicSelect.innerHTML = "";
     const combinations = new Set<string>();
     const indices = new Set<string>();
@@ -2290,6 +2381,25 @@ function buildPanel(container: HTMLElement): () => void {
   const presetConnection = initialCatalogUrl ? connectCatalog() : undefined;
   searchButton.addEventListener("click", () => void runSearch(false));
   clearResultsButton.addEventListener("click", () => clearSearchResults());
+  pointCloudButton.addEventListener("click", async () => {
+    if (pointCloudButton.disabled) return;
+    setDisabled(pointCloudButton, true);
+    setStatus(labels.adding(labels.pointClouds));
+    try {
+      if (!connection) throw new Error(labels.addFailed);
+      const made = await addPointCloudSet(connection, allItems, controller.signal);
+      const notes = [
+        made.failed.length ? labels.pointCloudsFailed(made.failed.join(", ")) : "",
+        made.skipped ? labels.pointCloudsSkipped(made.skipped) : "",
+      ].filter(Boolean);
+      if (!made.layerIds.length) throw new Error(notes.join(" ") || labels.addFailed);
+      setStatus([labels.pointCloudsLoaded(made.layerIds.length), ...notes].join(" "));
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : labels.addFailed, true);
+    } finally {
+      setDisabled(pointCloudButton, false);
+    }
+  });
   mosaicSelect.addEventListener("change", () => {
     const [kind, ...rest] = mosaicSelect.value.split(":");
     const name = rest.join(":");
